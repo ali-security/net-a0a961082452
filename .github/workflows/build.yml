@@ -1,0 +1,102 @@
+name: build
+
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested by the Go
+# project's own TryBots / LUCI builders), so this workflow is written from
+# scratch. It mirrors what the repo itself declares: the Go version from go.mod
+# and the standard `go build ./...` / `go test ./...` commands from
+# CONTRIBUTING.md.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run; empty runs the full suite
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build, test and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download modules
+        run: go mod download
+
+      # Pack the module zip BEFORE building/testing, from a pristine copy of the
+      # tree, so no build byproduct can leak into the artifact. The copy drops
+      # .git/ (never part of a module zip) and .github/ (this workflow is Seal's
+      # own CI plumbing; upstream ships no .github, so keeping it would add a
+      # member the public zip does not have).
+      - name: Create module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/build_output"
+          rsync -a --exclude='.git/' --exclude='.github/' ./ /tmp/modsrc/
+          mkdir -p /tmp/ziptool
+          cat > /tmp/ziptool/create_mod.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd /tmp/ziptool
+          go mod init example.com/ziptool
+          go get golang.org/x/mod/zip
+          go run ./create_mod.go golang.org/x/net v0.45.0 /tmp/modsrc "${GITHUB_WORKSPACE}/build_output/v0.45.0.zip"
+          unzip -l "${GITHUB_WORKSPACE}/build_output/v0.45.0.zip" | tail -n 5
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -run "^($(echo '${{ inputs.test-filter }}' | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${{ inputs.test-filter }}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || {
+                echo "selected test ${t} never ran"; exit 1; }
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
