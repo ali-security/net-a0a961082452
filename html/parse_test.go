@@ -468,6 +468,64 @@ func TestParseFragmentWithNilContext(t *testing.T) {
 	ParseFragment(strings.NewReader("<p>hello</p>"), nil)
 }
 
+// TestDuplicateAttributesParseRender checks that parsing arbitrary HTML and
+// rendering it again cannot smuggle a second, differently-valued copy of an
+// attribute past a sanitizer: per WHATWG 13.2.5.33 duplicate attribute names
+// are dropped (ASCII case-insensitively) during tokenization, so only the
+// first occurrence survives into the tree and into Render's output.
+func TestDuplicateAttributesParseRender(t *testing.T) {
+	testCases := []struct {
+		desc string
+		html string
+		want string
+	}{
+		{
+			"duplicate href",
+			`<a href="/safe" href="javascript:alert(1)">x</a>`,
+			`<a href="/safe">x</a>`,
+		},
+		{
+			"duplicate href, different ASCII case",
+			`<a href="/safe" HREF="javascript:alert(1)">x</a>`,
+			`<a href="/safe">x</a>`,
+		},
+		{
+			"duplicate event handler smuggled after a safe attribute",
+			`<img src="a.png" onerror="" onerror="alert(1)">`,
+			`<img src="a.png" onerror=""/>`,
+		},
+		{
+			"duplicate attribute in foreign content",
+			`<svg><a xlink:href="/safe" xlink:href="javascript:alert(1)"></a></svg>`,
+			`<svg><a xlink:href="/safe"></a></svg>`,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			n, err := ParseFragment(strings.NewReader(tc.html), &Node{
+				Type:     ElementNode,
+				Data:     "body",
+				DataAtom: atom.Body,
+			})
+			if err != nil {
+				t.Fatalf("ParseFragment: %v", err)
+			}
+			b := &bytes.Buffer{}
+			for _, c := range n {
+				if err := Render(b, c); err != nil {
+					t.Fatalf("Render: %v", err)
+				}
+			}
+			if got := b.String(); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+			if strings.Contains(b.String(), "alert(1)") {
+				t.Errorf("rendered output leaked the duplicate attribute value: %q", b.String())
+			}
+		})
+	}
+}
+
 func TestParseFragmentForeignContentTemplates(t *testing.T) {
 	srcs := []string{
 		"<math><html><template><mn><template></template></template>",
